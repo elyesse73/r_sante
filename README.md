@@ -89,7 +89,7 @@ Our model successfully captures the "Human Baseline" and models biological uncer
 | --- | --- | --- |
 | **Human Agreement** | **~80.5%** | Theoretical upper bound (Expert 1 vs Expert 2). |
 | **Model Accuracy (Top-1)** | **~87.0%** | The model matches human expert performance. |
-| **Indulgent Accuracy (Top-2)** | **95.5%** | The correct phase is almost always in the top 2 choices. |
+| **Indulgent Accuracy (Top-2)** | **~95.5%** | The correct phase is almost always in the top 2 choices. |
 | **Calibration** | **Success** | KDE plots confirm high confidence on consensus, low confidence on disagreement. |
 
 ### Visual Interpretation
