@@ -3,7 +3,7 @@ import time
 import copy
 from torchvision import models
 from torch import nn
-from config import CONFIG
+from src.config import CONFIG
 
 # --- 1. The "Bounded Accuracy" Metric ---
 def calc_bounded_accuracy(logits, targets, low_threshold=0.25, high_threshold_on_ambiguity=0.75):

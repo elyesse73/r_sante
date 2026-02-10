@@ -9,12 +9,14 @@ import torch
 from src.visualization import (
     visualize_tsne_dual_expert, 
     visualize_upstream_downstream_comparison, 
-    visualize_explanation_simple
+    visualize_explanation_simple,
+    visualize_confidence_tsne
 )
 
 def evaluate_expert_comparison(model, loader, df_source, device):
     """
-    Compares model predictions against Expert 1 and Expert 2 separately.
+    Compares model predictions against Expert 1 and Expert 2 separately,
+    and also compares Expert 1 against Expert 2.
 
     Args:
         model: Trained PyTorch model.
@@ -57,29 +59,42 @@ def evaluate_expert_comparison(model, loader, df_source, device):
     print(classification_report(y_true_exp2, all_preds, target_names=class_names))
 
     # --- COMPARATIVE VISUALIZATION ---
-    fig, axes = plt.subplots(1, 2, figsize=(20, 8))
+    # Changed to 3 columns to include Inter-Expert agreement
+    fig, axes = plt.subplots(1, 3, figsize=(24, 7))
 
-    # Confusion Matrix: Expert 1
+    # 1. Confusion Matrix: Model vs Expert 1
     cm1 = confusion_matrix(y_true_exp1, all_preds, labels=range(len(class_names)))
-    # Normalize to percentages
-    cm1_normalized = cm1.astype('float') / cm1.sum(axis=1)[:, np.newaxis]
+    # Normalize to percentages (adding epsilon to avoid division by zero)
+    cm1_normalized = cm1.astype('float') / (cm1.sum(axis=1)[:, np.newaxis] + 1e-7)
 
-    sns.heatmap(cm1_normalized, annot=True, fmt='.2%', cmap='Blues',
+    sns.heatmap(cm1_normalized, annot=True, fmt='.2%', cmap='Blues', cbar=False,
                 xticklabels=class_names, yticklabels=class_names, ax=axes[0], vmin=0, vmax=1)
-    axes[0].set_title("Confusion vs EXPERT 1 (Normalized)")
+    axes[0].set_title("Model vs EXPERT 1 (Normalized)")
     axes[0].set_xlabel("Model Prediction")
     axes[0].set_ylabel("True Label (Expert 1)")
 
-    # Confusion Matrix: Expert 2
+    # 2. Confusion Matrix: Model vs Expert 2
     cm2 = confusion_matrix(y_true_exp2, all_preds, labels=range(len(class_names)))
     # Normalize to percentages
-    cm2_normalized = cm2.astype('float') / cm2.sum(axis=1)[:, np.newaxis]
+    cm2_normalized = cm2.astype('float') / (cm2.sum(axis=1)[:, np.newaxis] + 1e-7)
 
-    sns.heatmap(cm2_normalized, annot=True, fmt='.2%', cmap='Greens',
+    sns.heatmap(cm2_normalized, annot=True, fmt='.2%', cmap='Greens', cbar=False,
                 xticklabels=class_names, yticklabels=class_names, ax=axes[1], vmin=0, vmax=1)
-    axes[1].set_title("Confusion vs EXPERT 2 (Normalized)")
+    axes[1].set_title("Model vs EXPERT 2 (Normalized)")
     axes[1].set_xlabel("Model Prediction")
     axes[1].set_ylabel("True Label (Expert 2)")
+
+    # 3. Confusion Matrix: Expert 1 vs Expert 2 (Inter-Annotator Agreement)
+    # We treat Expert 1 as "True" and Expert 2 as "Predicted" to see alignment
+    cm3 = confusion_matrix(y_true_exp1, y_true_exp2, labels=range(len(class_names)))
+    # Normalize to percentages
+    cm3_normalized = cm3.astype('float') / (cm3.sum(axis=1)[:, np.newaxis] + 1e-7)
+
+    sns.heatmap(cm3_normalized, annot=True, fmt='.2%', cmap='Oranges', cbar=False,
+                xticklabels=class_names, yticklabels=class_names, ax=axes[2], vmin=0, vmax=1)
+    axes[2].set_title("INTER-EXPERT Agreement (Exp 1 vs Exp 2)")
+    axes[2].set_xlabel("Expert 2 Label")
+    axes[2].set_ylabel("Expert 1 Label")
 
     plt.tight_layout()
     plt.show()
@@ -166,14 +181,14 @@ def analyze_uncertainty(model, loader, device):
 def evaluate_by_groups(model, loader, df_source, device):
     """
     Separate analysis:
-    - Group A: Experts agree (Consensus)
-    - Group B: Experts disagree (Ambiguity)
+    - Group A: Experts agree (Consensus) -> Measured by Top-1 Accuracy.
+    - Group B: Experts disagree (Ambiguity) -> Measured by "Double Coverage" (do Top-2 match both experts?).
     """
     model.eval()
 
     # Storage
-    all_preds_idx = []
-    all_confidences = [] # To see if the model "doubts"
+    all_top2_preds = [] # Store indices of top 2 predictions
+    all_confidences = [] # Store probability of the #1 prediction (to measure doubt)
 
     print("Group analysis in progress...")
     with torch.no_grad():
@@ -181,16 +196,24 @@ def evaluate_by_groups(model, loader, df_source, device):
             inputs = inputs.to(device)
             outputs = model(inputs)
 
-            # Get probabilities (Softmax) to check confidence
+            # Get probabilities
             probs = torch.softmax(outputs, dim=1)
-            confidences, preds = torch.max(probs, dim=1)
-
-            all_preds_idx.extend(preds.cpu().numpy())
+            
+            # Get Top-1 confidence (for the density plot)
+            confidences, _ = torch.max(probs, dim=1)
             all_confidences.extend(confidences.cpu().numpy())
 
+            # Get Top-2 indices (for the new metric)
+            # top2_result shape: (Batch_Size, 2)
+            _, top2_result = probs.topk(2, dim=1)
+            all_top2_preds.extend(top2_result.cpu().numpy())
+
     # Convert to numpy
-    all_preds_idx = np.array(all_preds_idx)
-    all_confidences = np.array(all_confidences)
+    all_top2_preds = np.array(all_top2_preds) # Shape (N, 2)
+    all_confidences = np.array(all_confidences) # Shape (N,)
+
+    # Extract Top-1 from Top-2 (it's just the first column) for Group A
+    all_preds_top1 = all_top2_preds[:, 0]
 
     # --- 1. GROUP SEPARATION VIA DATAFRAME ---
     # Recreate masks based on source DataFrame (aligned with loader shuffle=False)
@@ -200,9 +223,9 @@ def evaluate_by_groups(model, loader, df_source, device):
     print(f"\nDistribution: {mask_agreement.sum()} Agreement cases (A) / {mask_disagreement.sum()} Disagreement cases (B)")
 
     # --- 2. GROUP A ANALYSIS (AGREEMENT) ---
-    # Here, the truth is simple: Expert 1 = Expert 2
+    # Metric: Standard Accuracy (Does Top-1 match the consensus?)
     y_true_A = df_source.loc[mask_agreement, 'expert1_label'].map(loader.dataset.class_to_idx).values
-    preds_A = all_preds_idx[mask_agreement]
+    preds_A = all_preds_top1[mask_agreement]
     conf_A = all_confidences[mask_agreement]
 
     acc_A = accuracy_score(y_true_A, preds_A)
@@ -210,23 +233,36 @@ def evaluate_by_groups(model, loader, df_source, device):
     print(f"   -> Average Model Confidence : {conf_A.mean()*100:.1f}%")
 
     # --- 3. GROUP B ANALYSIS (DISAGREEMENT) ---
-    # Here, we use "Relaxed Accuracy": Correct if model == Exp1 OR model == Exp2
+    # Metric: Perfect Ambiguity Coverage (Do Top-2 predictions contain BOTH Expert 1 AND Expert 2?)
+    
+    # Get ground truths for Disagreement cases
     y_true_B1 = df_source.loc[mask_disagreement, 'expert1_label'].map(loader.dataset.class_to_idx).values
     y_true_B2 = df_source.loc[mask_disagreement, 'expert2_label'].map(loader.dataset.class_to_idx).values
-    preds_B = all_preds_idx[mask_disagreement]
+    
+    # Get Top-2 model predictions for these cases
+    preds_top2_B = all_top2_preds[mask_disagreement] # Shape (N_B, 2)
     conf_B = all_confidences[mask_disagreement]
 
-    # Calculate Relaxed Accuracy: (Pred == Exp1) OR (Pred == Exp2)
-    # Since Exp1 != Exp2, these conditions are mutually exclusive, we can sum booleans
-    is_correct_relaxed = (preds_B == y_true_B1) | (preds_B == y_true_B2)
-    acc_B_relaxed = is_correct_relaxed.mean()
+    # Logic: 
+    # 1. Is Expert 1 in the model's Top 2?
+    exp1_in_top2 = (preds_top2_B[:, 0] == y_true_B1) | (preds_top2_B[:, 1] == y_true_B1)
+    
+    # 2. Is Expert 2 in the model's Top 2?
+    exp2_in_top2 = (preds_top2_B[:, 0] == y_true_B2) | (preds_top2_B[:, 1] == y_true_B2)
+    
+    # 3. STRICT CONDITION: BOTH must be true
+    # This means the model predicted exactly the two classes chosen by the experts (in any order)
+    perfect_coverage = exp1_in_top2 & exp2_in_top2
+    
+    acc_B_coverage = perfect_coverage.mean()
 
-    print(f"\n⚠️ GROUP B (Disagreement) - Relaxed Accuracy : {acc_B_relaxed*100:.2f}%")
-    print(f"   (The model agrees with at least one of the two experts)")
+    print(f"\n⚠️ GROUP B (Disagreement) - Double Coverage Accuracy : {acc_B_coverage*100:.2f}%")
+    print(f"   (The model's Top-2 predictions capture BOTH experts)")
     print(f"   -> Average Model Confidence : {conf_B.mean()*100:.1f}%")
 
     # --- 4. VISUALIZATION: LEARNED "DOUBT" ---
     plt.figure(figsize=(10, 6))
+    # We clip at 0.999 to avoid graphic bugs with KDE if many values are exactly 1.0
     sns.kdeplot(conf_A, fill=True, label='Group A (Consensus)', color='green', clip=(0,1))
     sns.kdeplot(conf_B, fill=True, label='Group B (Disagreement)', color='orange', clip=(0,1))
 
@@ -269,15 +305,14 @@ def run_full_test_battery(model, dataloaders, test_df, dataset_classes, device):
     # Note: evaluate_expert_comparison must be defined in this file or imported
     evaluate_expert_comparison(model, test_loader, test_df, device)
 
-    # --- 2. GROUP ANALYSIS (Consensus vs Ambiguity) ---
-    print("\n" + "="*40 + "\n2️⃣ GROUP PERFORMANCE (Agreement/Disagreement)\n" + "="*40)
+    # --- 2. TOP-2 INDULGENT CONFUSION MATRICES ---
+    print("\n" + "="*40 + "\n2️⃣ TOP-2 INDULGENT CONFUSION MATRICES\n" + "="*40)
+    evaluate_top2_indulgent(model, test_loader, test_df, device)
+
+    # --- 3. GROUP ANALYSIS (Consensus vs Ambiguity) ---
+    print("\n" + "="*40 + "\n3️⃣ GROUP PERFORMANCE (Agreement/Disagreement)\n" + "="*40)
     # Note: evaluate_by_groups must be defined in this file or imported
     evaluate_by_groups(model, test_loader, test_df, device)
-
-    # --- 3. UNCERTAINTY (Entropy) ---
-    print("\n" + "="*40 + "\n3️⃣ CALIBRATION & UNCERTAINTY (Entropy)\n" + "="*40)
-    # Note: analyze_uncertainty must be defined in this file or imported
-    analyze_uncertainty(model, test_loader, device)
 
     # --- 4. SOFT CONFUSION MATRIX (Relevant for Soft model, but works for both) ---
     print("\n" + "="*40 + "\n4️⃣ PROBABILISTIC CONFUSION MATRIX\n" + "="*40)
@@ -288,13 +323,18 @@ def run_full_test_battery(model, dataloaders, test_df, dataset_classes, device):
     print("\n" + "="*40 + "\n5️⃣ t-SNE: SPACE REPRESENTATION\n" + "="*40)
     # We can limit num_samples if the test set is huge, otherwise None to take all
     # Note: Pass 'device' if your updated visualization function requires it
-    visualize_tsne_dual_expert(model, test_loader, test_df, device, num_samples=None)
+    visualize_tsne_dual_expert(model, test_loader, test_df, num_samples=2000)
 
+    # --- 6. t-SNE COMPARISON: FEATURES vs CLASSIFIER OUTPUTS ---
     print("\n" + "="*40 + "\n6️⃣ t-SNE: 'EYE' VISION (Features) vs 'BRAIN' (Classifier)\n" + "="*40)
-    visualize_upstream_downstream_comparison(model, test_loader, test_df, device, num_samples=None)
+    visualize_upstream_downstream_comparison(model, test_loader, test_df, num_samples=2000)
 
-    # --- 6. GRAD-CAM (Explainability on a few images) ---
-    print("\n" + "="*40 + "\n7️⃣ GRAD-CAM: RANDOM EXAMPLES FROM TEST SET\n" + "="*40)
+    # --- 7. t-SNE COLORED BY CONFIDENCE (Model's "Doubt") ---
+    print("\n" + "="*40 + "\n7️⃣ t-SNE: CONFIDENCE LANDSCAPE\n" + "="*40)
+    visualize_confidence_tsne(model, test_loader, test_df, device, num_samples=2000)
+
+    # --- 8. GRAD-CAM (Explainability on a few images) ---
+    print("\n" + "="*40 + "\n8️⃣ GRAD-CAM: RANDOM EXAMPLES FROM TEST SET\n" + "="*40)
     
     # We need access to the underlying dataset for visualization (to get raw images)
     test_dataset = test_loader.dataset
@@ -307,3 +347,101 @@ def run_full_test_battery(model, dataloaders, test_df, dataset_classes, device):
             visualize_explanation_simple(model, test_dataset, idx, device)
     else:
         print("⚠️ Test dataset is empty, skipping Grad-CAM.")
+
+def evaluate_top2_indulgent(model, loader, df_source, device):
+    """
+    Displays confusion matrices using "Top-2 Oracle" logic.
+    
+    Logic:
+    - If the ground truth label is within the model's top 2 predictions, 
+      we count it as a correct prediction (we 'force' the prediction to match the truth).
+    - If the ground truth is NOT in the top 2, we keep the model's top-1 prediction 
+      (the error is confirmed).
+
+    This helps visualize if errors are "near misses" (hesitation between similar phases)
+    or "complete misses".
+    """
+    model.eval()
+    
+    # Storage for the "corrected" predictions
+    preds_indulgent_exp1 = [] 
+    preds_indulgent_exp2 = [] 
+    
+    # Retrieve Ground Truths and Class Mappings
+    class_to_idx = loader.dataset.class_to_idx
+    class_names = loader.dataset.classes
+    
+    # Pre-load expert labels as integers to speed up the loop
+    y_true_exp1 = df_source['expert1_label'].map(class_to_idx).values
+    y_true_exp2 = df_source['expert2_label'].map(class_to_idx).values
+    
+    print("Generating Top-2 predictions...")
+    
+    counter = 0
+    with torch.no_grad():
+        for inputs, _ in loader:
+            inputs = inputs.to(device)
+            outputs = model(inputs)
+            
+            # Get the top 2 class indices for each image
+            # top2_preds.shape -> (Batch_Size, 2)
+            _, top2_preds = outputs.topk(2, dim=1)
+            top2_preds = top2_preds.cpu().numpy()
+            
+            # Iterate through the batch
+            for i in range(len(top2_preds)):
+                # Calculate the global index of the image in the dataset
+                idx_global = counter + i
+                
+                # --- LOGIC VS EXPERT 1 ---
+                true_label_1 = y_true_exp1[idx_global]
+                
+                # Check if the true label is in the top 2 predictions
+                if true_label_1 in top2_preds[i]:
+                    # Indulgent: We accept the prediction as correct
+                    preds_indulgent_exp1.append(true_label_1)
+                else:
+                    # Strict: We keep the top-1 prediction (it's a miss)
+                    preds_indulgent_exp1.append(top2_preds[i][0])
+                    
+                # --- LOGIC VS EXPERT 2 ---
+                true_label_2 = y_true_exp2[idx_global]
+                
+                if true_label_2 in top2_preds[i]:
+                    preds_indulgent_exp2.append(true_label_2)
+                else:
+                    preds_indulgent_exp2.append(top2_preds[i][0])
+            
+            counter += len(inputs)
+
+    # --- VISUALIZATION ---
+    fig, axes = plt.subplots(1, 2, figsize=(16, 7))
+    
+    # Helper function to plot normalized confusion matrix
+    def plot_cm(y_true, y_pred, ax, title, color_map):
+        cm = confusion_matrix(y_true, y_pred, labels=range(len(class_names)))
+        
+        # Normalize to percentages (add epsilon to avoid division by zero)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            cm_norm = cm.astype('float') / (cm.sum(axis=1)[:, np.newaxis] + 1e-7)
+        cm_norm = np.nan_to_num(cm_norm) # Replace NaNs with 0 if a class is empty
+        
+        # Calculate "Top-2 Accuracy" (Trace / Sum)
+        acc = np.trace(cm) / np.sum(cm)
+        
+        sns.heatmap(cm_norm, annot=True, fmt='.1%', cmap=color_map, cbar=False,
+                    xticklabels=class_names, yticklabels=class_names, ax=ax, vmin=0, vmax=1)
+        ax.set_title(f"{title}\n(Top-2 Indulgent Acc: {acc*100:.2f}%)")
+        ax.set_xlabel("Prediction (Top-2 Corrected)")
+        ax.set_ylabel("True Label")
+
+    # 1. Model vs Expert 1 (Indulgent)
+    plot_cm(y_true_exp1, preds_indulgent_exp1, axes[0], 
+            "Model vs EXPERT 1 (Top-2 Indulgent)", 'Purples')
+    
+    # 2. Model vs Expert 2 (Indulgent)
+    plot_cm(y_true_exp2, preds_indulgent_exp2, axes[1], 
+            "Model vs EXPERT 2 (Top-2 Indulgent)", 'Purples')
+
+    plt.tight_layout()
+    plt.show()

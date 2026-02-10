@@ -1,9 +1,9 @@
 import torch
 import matplotlib.pyplot as plt
-from torchvision import transforms as v2
-from torchvision.transforms import InterpolationMode
-from config import CONFIG
-from dataset import MacenkoAugment
+from torchvision import transforms
+from torchvision.transforms import v2, InterpolationMode
+from src.config import CONFIG
+from src.dataset import MacenkoAugment
 
 # --- 4. TRANSFORMATION FACTORY (v2 Modernized & Merged Version) ---
 def get_transforms(config, ref_paths=None):
@@ -162,7 +162,7 @@ def prepare_data_loaders(full_df, config, root_dir, get_transforms_fn, dataset_c
         df_final,
         test_size=0.2,
         stratify=df_final['stratify_key'],
-        random_state=config['SEED'] # Use config seed
+        random_state=42
     )
 
     # Split Temp: 50% Val, 50% Test (resulting in 10% each of total)
@@ -170,14 +170,14 @@ def prepare_data_loaders(full_df, config, root_dir, get_transforms_fn, dataset_c
         temp_df,
         test_size=0.5,
         stratify=temp_df['expert1_label'],
-        random_state=config['SEED']
+        random_state=42
     )
 
     print(f"Generated splits : Train={len(train_df)}, Val={len(val_df)}, Test={len(test_df)}")
 
     # --- 4. PREPARE TRANSFORMS (Macenko) ---
     # Pick random reference images from the training set only
-    random_refs = train_df.sample(n=5, random_state=config['SEED'])
+    random_refs = train_df.sample(n=5, random_state=42)
     ref_paths_list = [os.path.join(root_dir, f"{row['dataset']}_{row['uid']}.png") for _, row in random_refs.iterrows()]
 
     # Generate transforms dictionary
@@ -185,9 +185,9 @@ def prepare_data_loaders(full_df, config, root_dir, get_transforms_fn, dataset_c
 
     # --- 5. CREATE DATASETS ---
     # Note: Validate & Test use 'val' transforms (no augmentation)
-    train_dataset = dataset_cls(dataframe=train_df, root_dir=root_dir, transform=data_transforms['train'])
-    val_dataset   = dataset_cls(dataframe=val_df,   root_dir=root_dir, transform=data_transforms['val'])
-    test_dataset  = dataset_cls(dataframe=test_df,  root_dir=root_dir, transform=data_transforms['val'])
+    train_dataset = dataset_cls(train_df, root_dir=root_dir, transform=data_transforms['train'])
+    val_dataset   = dataset_cls(val_df,   root_dir=root_dir, transform=data_transforms['val'])
+    test_dataset  = dataset_cls(test_df,  root_dir=root_dir, transform=data_transforms['val'])
 
     # --- 6. SAMPLER (Class Imbalance Handling) ---
     sampler = None

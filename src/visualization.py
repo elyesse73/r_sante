@@ -3,7 +3,14 @@ import matplotlib.pyplot as plt
 import torch
 import seaborn as sns
 from sklearn.manifold import TSNE
-from config import CONFIG
+from src.config import CONFIG
+
+try:
+    from pytorch_grad_cam import GradCAMPlusPlus
+    from pytorch_grad_cam.utils.image import show_cam_on_image
+    HAS_GRAD_CAM = True
+except ImportError:
+    HAS_GRAD_CAM = False
 
 def plot_array(fig, dataset, classes_to_plot=None, samples_per_class=7):
     # --- CORRECTION ---
@@ -223,3 +230,228 @@ def visualize_upstream_downstream_comparison(model, loader, df_source, num_sampl
 
     plt.tight_layout()
     plt.show()
+
+def format_prediction_text(scores, class_names, top_k=3):
+    """
+    Formats prediction scores (or soft labels) into a readable string.
+
+    Args:
+        scores: A torch.Tensor (for soft labels) or numpy.ndarray (for probabilities).
+        class_names: A list of class names.
+        top_k: Number of top predictions to display for probabilities.
+    """
+    if isinstance(scores, torch.Tensor):
+        # Handle soft labels (ground truth)
+        active_classes_info = []
+        for i, score in enumerate(scores):
+            if score > 0: # Only consider classes that have a positive vote
+                if scores.sum().item() == 1.0 and score.item() == 1.0: # If it's a hard label (sum is 1.0 and this is the only one)
+                    active_classes_info.append(f"{class_names[i]}")
+                elif scores.sum().item() > 0: # Soft labels with proportions
+                    active_classes_info.append(f"{class_names[i]} ({score.item()*100:.0f}%)")
+        return ", ".join(active_classes_info) if active_classes_info else "No Label"
+    elif isinstance(scores, np.ndarray):
+        # Handle predicted probabilities
+        sorted_indices = np.argsort(scores)[::-1]
+        top_predictions = []
+        for i in range(min(top_k, len(sorted_indices))):
+            idx = sorted_indices[i]
+            prob = scores[idx]
+            top_predictions.append(f"{class_names[idx]} ({prob*100:.2f}%)")
+        return ", ".join(top_predictions)
+    else:
+        return "Invalid score format"
+
+def visualize_explanation_simple(model, dataset, idx, device):
+    """
+    Cleaned up version: Simply displays the text above the image.
+    """
+    model.eval()
+
+    if not HAS_GRAD_CAM:
+        print(f"⚠️ [Info] Grad-CAM désactivé (librairie manquante). Affichage simple.")
+        plt.figure(figsize=(6, 6))
+        plt.imshow(img_display)
+        plt.title(f"Image #{idx}\nVérité: {gt_text}\nPrédiction: {pred_text}")
+        plt.axis('off')
+        plt.show()
+        return
+
+    # --- CRITICAL FIX: Force gradient activation for Grad-CAM ---
+    with torch.set_grad_enabled(True):
+
+        # 1. Data
+        img_tensor, label_vector = dataset[idx]
+        input_tensor = img_tensor.unsqueeze(0).to(device)
+
+        # 2. Prediction
+        output = model(input_tensor)
+        # .detach() is important here because we activated gradients
+        pred_probs = torch.softmax(output, dim=1).cpu().detach().numpy()[0]
+
+        # 3. Texts
+        # (Assuming format_prediction_text is defined in a previous cell)
+        gt_text = format_prediction_text(label_vector, dataset.classes)
+        pred_text = format_prediction_text(pred_probs, dataset.classes)
+
+        # 4. Grad-CAM++ (With context manager to clean up hooks)
+        target_layers = [model.features[-1][-1]]
+
+        # Using 'with' to avoid conflicts if the cell is re-run
+        with GradCAMPlusPlus(model=model, target_layers=target_layers) as cam:
+            target_class = np.argmax(pred_probs)
+            # Generate CAM
+            grayscale_cam = cam(input_tensor=input_tensor, targets=None)[0, :]
+
+    # 5. Denormalization (Outside gradient calculation, for display only)
+    mean = np.array([0.485, 0.456, 0.406])
+    std = np.array([0.229, 0.224, 0.225])
+    img_display = img_tensor.permute(1, 2, 0).cpu().numpy()
+    img_display = std * img_display + mean
+    img_display = np.clip(img_display, 0, 1)
+
+    visualization = show_cam_on_image(img_display, grayscale_cam, use_rgb=True)
+
+    # --- DISPLAY (Identical to your request) ---
+    fig, axes = plt.subplots(1, 2, figsize=(12, 6))
+
+    # LEFT: TRUTH
+    axes[0].imshow(img_display)
+    axes[0].set_title(f"Image #{idx} - Truth (Experts)\n\n{gt_text}",
+                      fontsize=11, loc='left')
+    axes[0].axis('off')
+
+    # RIGHT: PREDICTION
+    axes[1].imshow(visualization)
+    axes[1].set_title(f"Grad-CAM++ (Focus: {dataset.classes[target_class]})\n\n{pred_text}",
+                      fontsize=11, loc='left', color='darkblue')
+    axes[1].axis('off')
+
+    plt.tight_layout()
+    plt.show()
+
+def visualize_confidence_tsne(model, loader, df_source, device, num_samples=2000):
+    """
+    Generates a t-SNE visualization colored by the model's confidence.
+    
+    Visual Encoding:
+    - Style: Matches the "Seaborn/Paper" aesthetic (White background, soft grid).
+    - Color (Gradient): Red-Yellow-Green Colormap.
+      (Red = Low Confidence/Doubt, Green = High Confidence/Certainty)
+    - Shape:
+      o (Circle) = Experts Agree (Consensus)
+      X (Cross)  = Experts Disagree (Ambiguity)
+      
+    Hypothesis: 
+    We expect high confidence (Green) in cluster centers and low confidence 
+    (Red/Orange + Crosses) at the boundaries between clusters.
+    """
+    model.eval()
+    
+    features_list = []
+    confidences_list = []
+    
+    print(f"Extracting features & confidence for t-SNE (Max samples: {num_samples})...")
+    
+    count = 0
+    with torch.no_grad():
+        for inputs, _ in loader:
+            inputs = inputs.to(device)
+            
+            # 1. Extract Features (for t-SNE coordinates)
+            # Assuming ConvNeXt architecture
+            feat_map = model.features(inputs)
+            x = model.avgpool(feat_map)
+            # Flatten for the linear layer
+            x_flat = model.classifier[0](x) # LayerNorm/Flatten usually
+            
+            # Use penultimate layer features
+            features_list.append(model.classifier[1](x_flat).cpu()) 
+            
+            # 2. Extract Confidence (for Color)
+            # We run the full forward pass to get probabilities
+            outputs = model(inputs)
+            probs = torch.softmax(outputs, dim=1)
+            # We take the probability of the predicted class (Max prob)
+            max_probs, _ = torch.max(probs, dim=1)
+            confidences_list.append(max_probs.cpu())
+            
+            count += inputs.size(0)
+            if num_samples and count >= num_samples:
+                break
+                
+    # Concatenate results
+    X_features = torch.cat(features_list, dim=0).numpy()
+    confidences = torch.cat(confidences_list, dim=0).numpy()
+    
+    # Align DataFrame with the subset processed
+    df_subset = df_source.iloc[:X_features.shape[0]].copy()
+    
+    # Create Agreement Mask
+    agreement_mask = (df_subset['expert1_label'] == df_subset['expert2_label']).values
+    
+    print("Computing t-SNE (this may take a moment)...")
+    tsne = TSNE(n_components=2, random_state=42, init='pca', learning_rate='auto')
+    X_embedded = tsne.fit_transform(X_features)
+    
+    # --- PLOTTING (Refined Aesthetic) ---
+    
+    # Force the style context to ensure the look matches "masterclass.png"
+    # 'seaborn-whitegrid' gives the white background + grey grid lines
+    try:
+        style_context = 'seaborn-v0_8-whitegrid'
+    except:
+        style_context = 'seaborn-whitegrid' # Fallback for older matplotlib versions
+
+    with plt.style.context(style_context): 
+        fig, ax = plt.subplots(figsize=(14, 10))
+        
+        # 1. Define the Colormap (Red -> Yellow -> Green)
+        # Red = Doubt (0.0), Green = Certainty (1.0)
+        cmap_name = 'RdYlGn' 
+        
+        # 2. Plot Consensus Points (Circles) - Background Layer
+        sc1 = ax.scatter(
+            X_embedded[agreement_mask, 0], 
+            X_embedded[agreement_mask, 1],
+            c=confidences[agreement_mask],
+            cmap=cmap_name,
+            marker='o',
+            s=70,          # Size
+            alpha=0.8,     # Opacity
+            label='Consensus (Agree)',
+            edgecolors='white', # White edge makes it look clean (like stickers)
+            linewidth=0.8,
+            vmin=0.4, vmax=1.0  # Clip colors: <40% is pure red, >100% is pure green
+        )
+        
+        # 3. Plot Disagreement Points (Crosses) - Foreground Layer
+        sc2 = ax.scatter(
+            X_embedded[~agreement_mask, 0], 
+            X_embedded[~agreement_mask, 1],
+            c=confidences[~agreement_mask],
+            cmap=cmap_name,
+            marker='X',
+            s=90,          # Slightly larger to pop out
+            alpha=1.0,     # Full opacity
+            label='Ambiguity (Disagree)',
+            edgecolors='k', # Thin black edge to define the cross shape clearly
+            linewidth=0.5,
+            vmin=0.4, vmax=1.0
+        )
+        
+        # 4. Decoration matching the reference image
+        ax.grid(True, linestyle='--', alpha=0.4) # Dashed, soft grid
+        ax.set_title("t-SNE learned Space colored by Model Confidence\n(Red = Doubt, Green = Certainty)", fontsize=16, pad=20)
+        
+        # Colorbar configuration (Modern look)
+        cbar = plt.colorbar(sc1, ax=ax, fraction=0.046, pad=0.04)
+        cbar.set_label('Model Confidence (Probability)', rotation=270, labelpad=20, fontsize=12)
+        cbar.outline.set_visible(False) 
+        
+        # Legend configuration
+        legend = ax.legend(loc='upper right', frameon=True, fontsize=12, fancybox=True, framealpha=0.9)
+        legend.get_frame().set_edgecolor('lightgray')
+
+        plt.tight_layout()
+        plt.show()

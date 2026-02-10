@@ -5,10 +5,10 @@ import torchstain
 import numpy as np
 from torch.utils.data import Dataset
 from PIL import Image
-from config import CONFIG
+from src.config import CONFIG
 
 class MitosisDataset(Dataset):
-    def __init__(self, data, transform=None):
+    def __init__(self, data, root_dir, transform=None):
         """
         data : The filtered DataFrame containing only the relevant samples for this mode (AMF or NMF)
         root_dir : The root path for images (defined by config)
@@ -17,6 +17,7 @@ class MitosisDataset(Dataset):
 
         self.data = data.reset_index(drop=True)
         self.transform = transform
+        self.root_dir = root_dir
         
         # --- AUTOMATIC CLASS DETECTION ---
         # We check which labels truly exist in this subset
